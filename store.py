@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class SyncAlreadyRunning(RuntimeError):
@@ -405,6 +405,58 @@ def _migrate(conn: sqlite3.Connection) -> None:
             UNIQUE(canonical_table, canonical_id, raw_record_id)
         );
 
+        -- Provider-agnostic daily health metrics. One row per
+        -- (day, source, metric). Used by the Google Health and Fitbit
+        -- connectors (PR #3, #4) and the future Oura KV migration
+        -- (PR #5). metric_unit is the canonical unit so the analysis
+        -- tools can convert before display. metadata_json keeps the
+        -- raw provider payload for audit / re-normalisation.
+        CREATE TABLE IF NOT EXISTS daily_health_metrics (
+            day TEXT NOT NULL,
+            source TEXT NOT NULL,
+            metric TEXT NOT NULL,
+            value_double REAL,
+            metric_unit TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (day, source, metric)
+        );
+
+        -- Sampled time-series from wearable / health APIs. Heart
+        -- rate, HRV, oxygen saturation, and similar per-sample
+        -- metrics live here. Distinct from raw_records (audit trail
+        -- of the original API response) — google_health_samples is
+        -- the canonical, normalised surface the analysis tools read.
+        CREATE TABLE IF NOT EXISTS google_health_samples (
+            sample_id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            metric TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            timestamp_unix INTEGER,
+            value_double REAL NOT NULL,
+            raw_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Sleep + workout sessions from Google Health / Fitbit.
+        -- Mirrors the shape of oura_sleep_sessions and
+        -- oura_workouts but is provider-agnostic. metric_payload_json
+        -- holds the session-specific structure (sleep stages, zone
+        -- minutes, etc.) so the analysis tools can read it without
+        -- the raw_json wrapper.
+        CREATE TABLE IF NOT EXISTS google_health_sessions (
+            session_id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            session_type TEXT NOT NULL,
+            day TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT,
+            duration_seconds INTEGER,
+            metric_payload_json TEXT NOT NULL,
+            raw_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE INDEX IF NOT EXISTS idx_oura_sleep_day_type
             ON oura_sleep_sessions(day, type);
         CREATE INDEX IF NOT EXISTS idx_oura_heart_rate_timestamp
@@ -453,6 +505,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
             ON sync_errors(sync_run_id, sync_batch_id);
         CREATE INDEX IF NOT EXISTS idx_raw_records_source_object
             ON raw_records(source_id, object_type, extracted_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_daily_health_metrics_day_metric
+            ON daily_health_metrics(day, metric);
+        CREATE INDEX IF NOT EXISTS idx_daily_health_metrics_source_day
+            ON daily_health_metrics(source, day DESC);
+        CREATE INDEX IF NOT EXISTS idx_google_health_samples_source_metric_ts
+            ON google_health_samples(source, metric, timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_google_health_samples_ts
+            ON google_health_samples(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_google_health_sessions_source_day
+            ON google_health_sessions(source, day DESC);
+        CREATE INDEX IF NOT EXISTS idx_google_health_sessions_source_type_day
+            ON google_health_sessions(source, session_type, day DESC);
 
         CREATE VIEW IF NOT EXISTS daily_overview AS
             SELECT
