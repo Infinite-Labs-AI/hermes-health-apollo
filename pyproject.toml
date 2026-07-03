@@ -14,6 +14,10 @@ authors = [
 ]
 dependencies = [
   "hermes-agent>=0.1,<1",
+  # zoneinfo needs a timezone database; bundle the first-party fallback so local-day
+  # bucketing works on hosts without an OS tz database (otherwise it would silently
+  # degrade to UTC, reintroducing the off-by-one day for non-UTC users).
+  "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]
@@ -34,6 +38,9 @@ py-modules = [
   "commands",
   "onboarding",
   "oura",
+  "oauth_token",
+  "google_health",
+  "google_health_auth",
   "normalize",
   "context",
   "sync_control",

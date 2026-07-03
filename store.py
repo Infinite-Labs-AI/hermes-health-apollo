@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -8,6 +9,8 @@ from pathlib import Path
 
 
 SCHEMA_VERSION = 9
+
+logger = logging.getLogger(__name__)
 
 DAILY_OVERVIEW_SQL = """
     CREATE VIEW daily_overview AS
@@ -60,8 +63,8 @@ def database_path() -> Path:
 def connect() -> sqlite3.Connection:
     initialize()
     conn = sqlite3.connect(database_path())
+    _configure(conn)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
@@ -100,7 +103,50 @@ def _database_file_family(db_path: Path) -> tuple[Path, ...]:
     )
 
 
+def _reconcile_pr10_schema(conn: sqlite3.Connection) -> None:
+    """Replace PR #10's loose Google Health tables with the source-linked schema.
+
+    PR #10 (also schema v7) shipped free-text ``daily_health_metrics(day, source, ...)``
+    plus ``google_health_samples`` / ``google_health_sessions`` keyed by a global
+    provider id. Those are superseded by the source-linked canonical tables. A database
+    initialized from that branch would otherwise crash here, because the new
+    ``idx_daily_health_metrics_source_day`` index references ``source_id``, which the
+    loose table lacks. The incompatible tables are dropped before the canonical DDL
+    runs. No rows are migrated: this lands before any connector writes real data, so
+    any rows present are pre-production placeholders.
+    """
+    tables = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    # One-time migration: only run while upgrading from a pre-v8 schema. Once the
+    # database reaches the current version this is a no-op early-return, so the PR #10
+    # drop logic does not run on every initialize() forever.
+    if "schema_version" in tables:
+        row = conn.execute("SELECT version FROM schema_version").fetchone()
+        if row is not None and row[0] >= SCHEMA_VERSION:
+            return
+    if "daily_health_metrics" in tables:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(daily_health_metrics)")
+        }
+        if "source_id" not in columns:
+            discarded = conn.execute(
+                "SELECT COUNT(*) FROM daily_health_metrics"
+            ).fetchone()[0]
+            if discarded:
+                logger.warning(
+                    "Dropping %d row(s) from legacy PR #10 daily_health_metrics during "
+                    "schema reconcile; loose-schema rows are not migrated.",
+                    discarded,
+                )
+            conn.execute("DROP TABLE daily_health_metrics")
+    conn.execute("DROP TABLE IF EXISTS google_health_samples")
+    conn.execute("DROP TABLE IF EXISTS google_health_sessions")
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
+    _reconcile_pr10_schema(conn)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -496,6 +542,103 @@ def _migrate(conn: sqlite3.Connection) -> None:
             UNIQUE(canonical_table, canonical_id, raw_record_id)
         );
 
+        CREATE TABLE IF NOT EXISTS health_sample_observations (
+            source_id TEXT NOT NULL REFERENCES health_sources(source_id) ON DELETE CASCADE,
+            observation_key TEXT NOT NULL,
+            provider_user_id TEXT,
+            provider_data_type TEXT NOT NULL,
+            provider_point_name TEXT,
+            metric TEXT NOT NULL,
+            metric_component TEXT NOT NULL DEFAULT '',
+            sample_time TEXT NOT NULL,
+            sample_time_unix INTEGER,
+            value_number REAL,
+            value_text TEXT,
+            metric_unit TEXT,
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            quality_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (source_id, observation_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS health_interval_observations (
+            source_id TEXT NOT NULL REFERENCES health_sources(source_id) ON DELETE CASCADE,
+            observation_key TEXT NOT NULL,
+            provider_user_id TEXT,
+            provider_data_type TEXT NOT NULL,
+            provider_point_name TEXT,
+            metric TEXT NOT NULL,
+            metric_component TEXT NOT NULL DEFAULT '',
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            start_time_unix INTEGER,
+            end_time_unix INTEGER,
+            value_number REAL,
+            value_text TEXT,
+            metric_unit TEXT,
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            quality_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (source_id, observation_key),
+            -- The connector must normalize start_time/end_time to a single canonical
+            -- format (UTC, 'Z' suffix, fixed precision) for this lexical TEXT compare to
+            -- be reliable across mixed offsets. The *_unix CHECK enforces ordering
+            -- format-independently whenever the integer columns are populated.
+            CHECK(end_time >= start_time),
+            CHECK(
+                end_time_unix IS NULL
+                OR start_time_unix IS NULL
+                OR end_time_unix >= start_time_unix
+            )
+        );
+
+        CREATE TABLE IF NOT EXISTS health_sessions (
+            source_id TEXT NOT NULL REFERENCES health_sources(source_id) ON DELETE CASCADE,
+            session_key TEXT NOT NULL,
+            provider_user_id TEXT,
+            provider_session_id TEXT,
+            session_type TEXT NOT NULL,
+            day TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT,
+            duration_seconds INTEGER,
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            metric_payload_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (source_id, session_key)
+        );
+
+        -- PK leads with `day` for day-first rollup reads (all sources for a day);
+        -- source_id stays in the composite PK for per-source identity and also has the
+        -- dedicated idx_daily_health_metrics_source_day index for source-scoped access.
+        CREATE TABLE IF NOT EXISTS daily_health_metrics (
+            day TEXT NOT NULL,
+            source_id TEXT NOT NULL REFERENCES health_sources(source_id) ON DELETE CASCADE,
+            metric TEXT NOT NULL,
+            metric_component TEXT NOT NULL DEFAULT '',
+            provider_data_type TEXT,
+            aggregation_kind TEXT NOT NULL
+                CHECK(aggregation_kind IN (
+                    'provider_daily_summary',
+                    'provider_rollup',
+                    'provider_reconciled_rollup',
+                    'apollo_computed'
+                )),
+            value_number REAL,
+            value_text TEXT,
+            metric_unit TEXT,
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            quality_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (
+                day,
+                source_id,
+                metric,
+                metric_component,
+                aggregation_kind
+            )
+        );
+
         CREATE INDEX IF NOT EXISTS idx_oura_sleep_day_type
             ON oura_sleep_sessions(day, type);
         CREATE INDEX IF NOT EXISTS idx_oura_heart_rate_timestamp
@@ -550,6 +693,47 @@ def _migrate(conn: sqlite3.Connection) -> None:
             ON location_visits(day);
         CREATE INDEX IF NOT EXISTS idx_location_visits_location
             ON location_visits(location_id, day);
+        CREATE INDEX IF NOT EXISTS idx_health_sample_observations_metric_time
+            ON health_sample_observations(source_id, metric, sample_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_health_sample_observations_time
+            ON health_sample_observations(sample_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_health_interval_observations_metric_time
+            ON health_interval_observations(source_id, metric, start_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_health_interval_observations_time
+            ON health_interval_observations(start_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_health_sessions_source_day
+            ON health_sessions(source_id, day DESC);
+        CREATE INDEX IF NOT EXISTS idx_health_sessions_type_day
+            ON health_sessions(source_id, session_type, day DESC);
+        CREATE INDEX IF NOT EXISTS idx_daily_health_metrics_day_metric
+            ON daily_health_metrics(day, metric);
+        CREATE INDEX IF NOT EXISTS idx_daily_health_metrics_source_day
+            ON daily_health_metrics(source_id, day DESC);
+
+        CREATE VIEW IF NOT EXISTS daily_overview AS
+            SELECT
+                od.day,
+                od.readiness_score,
+                od.sleep_score,
+                od.activity_score,
+                od.stress_high_seconds,
+                od.recovery_high_seconds,
+                od.stress_day_summary,
+                od.resting_heart_rate,
+                od.hrv_balance,
+                od.spo2_average,
+                od.total_sleep_duration_seconds,
+                od.deep_sleep_duration_seconds,
+                od.primary_bedtime_start,
+                od.primary_bedtime_end,
+                cd.meeting_count,
+                cd.meeting_minutes,
+                cd.first_meeting_start,
+                cd.last_meeting_end,
+                ed.received_count
+            FROM oura_daily od
+            LEFT JOIN calendar_daily cd ON cd.day = od.day
+            LEFT JOIN email_daily ed ON ed.day = od.day;
         """
     )
     _ensure_column(conn, "oura_ring_battery", "producer_timestamp", "TEXT")
@@ -569,7 +753,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn,
         cadence_minutes=360,
         schedule_key="health-data-sync",
-        sources=("oura", "google_calendar", "gmail", "manual_food"),
+        sources=("oura", "google_calendar", "gmail", "manual_food", "google_health"),
     )
     current = conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
     if current == 0:
@@ -643,6 +827,7 @@ def sync_guard(provider: str):
     initialize()
     now = datetime.now(timezone.utc).isoformat()
     conn = sqlite3.connect(database_path())
+    _configure(conn)
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(

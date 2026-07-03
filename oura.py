@@ -4,18 +4,16 @@ import contextlib
 import hashlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
-import os
 import secrets
-import tempfile
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable
 from urllib import error as urllib_error
 from urllib import parse, request as urllib_request
 import webbrowser
 
-from . import normalize, store, sync_control
+from . import normalize, oauth_token, store, sync_control
 
 
 OURA_API_BASE_URL = "https://api.ouraring.com"
@@ -1002,13 +1000,11 @@ def token_path() -> Path:
 
 
 def pending_token_path(path: Path | None = None) -> Path:
-    token_file = path or token_path()
-    return token_file.with_name(f"{token_file.name}.pending")
+    return oauth_token.pending_path(path or token_path())
 
 
 def lock_path(path: Path | None = None) -> Path:
-    token_file = path or token_path()
-    return token_file.with_name(f"{token_file.name}.lock")
+    return oauth_token.lock_path(path or token_path())
 
 
 def pending_state_path() -> Path:
@@ -1016,14 +1012,12 @@ def pending_state_path() -> Path:
 
 
 def load_token(path: Path | None = None) -> dict[str, Any]:
-    token_file = path or token_path()
-    if not token_file.exists():
-        raise OuraNotConnected("Run `hermes health connect` before Oura sync.")
-    with token_file.open("r", encoding="utf-8") as handle:
-        token = json.load(handle)
-    if not isinstance(token, dict):
-        raise OuraNotConnected("Oura token file is invalid; re-run `/health connect`.")
-    return token
+    return oauth_token.load_token(
+        path or token_path(),
+        missing_exc=OuraNotConnected,
+        missing_message="Run `hermes health connect` before Oura sync.",
+        invalid_message="Oura token file is invalid; re-run `/health connect`.",
+    )
 
 
 def env_path() -> Path:
@@ -1031,56 +1025,36 @@ def env_path() -> Path:
 
 
 def load_oura_client_credentials(*, required: bool = True) -> tuple[str | None, str | None]:
-    client_id = os.environ.get("HERMES_OURA_CLIENT_ID")
-    client_secret = os.environ.get("HERMES_OURA_CLIENT_SECRET")
-    if (not client_id or not client_secret) and env_path().exists():
-        values = _read_env_file(env_path())
-        client_id = client_id or values.get("HERMES_OURA_CLIENT_ID")
-        client_secret = client_secret or values.get("HERMES_OURA_CLIENT_SECRET")
-    if required and (not client_id or not client_secret):
-        raise OuraNotConnected("Oura client credentials missing; re-run `/health connect`.")
-    return client_id, client_secret
+    return oauth_token.load_client_credentials(
+        env_file=env_path(),
+        id_key="HERMES_OURA_CLIENT_ID",
+        secret_key="HERMES_OURA_CLIENT_SECRET",
+        required=required,
+        missing_exc=OuraNotConnected,
+        missing_message="Oura client credentials missing; re-run `/health connect`.",
+    )
 
 
 def save_oura_client_credentials(client_id: str, client_secret: str) -> Path:
-    path = env_path()
-    values = _read_env_file(path) if path.exists() else {}
-    values["HERMES_OURA_CLIENT_ID"] = client_id
-    values["HERMES_OURA_CLIENT_SECRET"] = client_secret
-    lines = [f"{key}={_quote_env_value(value)}" for key, value in sorted(values.items())]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    if os.name != "nt":
-        path.chmod(0o600)
-    return path
+    return oauth_token.save_client_credentials(
+        env_file=env_path(),
+        values={
+            "HERMES_OURA_CLIENT_ID": client_id,
+            "HERMES_OURA_CLIENT_SECRET": client_secret,
+        },
+    )
 
 
 def clear_oura_client_credentials() -> bool:
-    path = env_path()
-    if not path.exists():
-        return False
-    values = _read_env_file(path)
-    removed = False
-    for key in ["HERMES_OURA_CLIENT_ID", "HERMES_OURA_CLIENT_SECRET"]:
-        if key in values:
-            removed = True
-            values.pop(key, None)
-    if not removed:
-        return False
-    if not values:
-        with contextlib.suppress(FileNotFoundError):
-            path.unlink()
-        return True
-    lines = [f"{key}={_quote_env_value(value)}" for key, value in sorted(values.items())]
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    if os.name != "nt":
-        path.chmod(0o600)
-    return True
+    return oauth_token.clear_client_credentials(
+        env_file=env_path(),
+        keys=["HERMES_OURA_CLIENT_ID", "HERMES_OURA_CLIENT_SECRET"],
+    )
 
 
 def save_pending_state(state: str) -> Path:
     path = pending_state_path()
-    _write_json_atomic(path, {"state": state}, private=True)
+    oauth_token.write_json_atomic(path, {"state": state}, private=True)
     return path
 
 
@@ -1108,18 +1082,11 @@ def validate_pending_state(state: str | None) -> None:
 
 
 def save_token(token: dict[str, Any], path: Path | None = None) -> Path:
-    token_file = path or token_path()
-    _write_json_atomic(token_file, token, private=True)
-    return token_file
+    return oauth_token.save_token(token, path or token_path())
 
 
-@contextlib.contextmanager
-def token_lock(path: Path | None = None) -> Iterator[None]:
-    lock_file = lock_path(path)
-    lock_file.parent.mkdir(parents=True, exist_ok=True)
-    with lock_file.open("a+b") as handle:
-        with _platform_lock(handle):
-            yield
+def token_lock(path: Path | None = None):
+    return oauth_token.token_lock(path or token_path())
 
 
 def refresh_access_token(
@@ -1130,44 +1097,23 @@ def refresh_access_token(
     now: Callable[[], datetime] | None = None,
     path: Path | None = None,
 ) -> dict[str, Any]:
-    clock = now or (lambda: datetime.now(UTC))
-    token_file = path or token_path()
-    with token_lock(token_file):
-        current = load_token(token_file)
-        if not token_expired(current, now=clock):
-            return current
-        refresh_token = current.get("refresh_token")
-        if not refresh_token:
-            raise OuraNotConnected("Oura refresh token missing; re-run `/health connect`.")
-
-        _write_json_atomic(pending_token_path(token_file), current, private=True)
-        response = http_post(
-            OURA_TOKEN_URL,
-            {
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": client_id,
-                "client_secret": client_secret,
-            },
-            {"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        if response.get("error") == "invalid_grant":
-            raise OuraNotConnected("Oura refresh failed; re-run `/health connect`.")
-        if "access_token" not in response:
-            raise OuraAPIError("Oura token refresh response did not include an access token.")
-
-        refreshed = dict(current)
-        refreshed["access_token"] = response["access_token"]
-        refreshed["refresh_token"] = response.get("refresh_token", refresh_token)
-        if "scope" in response:
-            refreshed["scope"] = response["scope"]
-        expires_in = int(response.get("expires_in", 3600))
-        refreshed["expires_at"] = (clock() + timedelta(seconds=expires_in)).isoformat()
-
-        save_token(refreshed, token_file)
-        with contextlib.suppress(FileNotFoundError):
-            pending_token_path(token_file).unlink()
-        return refreshed
+    return oauth_token.refresh_access_token(
+        token_file=path or token_path(),
+        token_url=OURA_TOKEN_URL,
+        client_id=client_id,
+        client_secret=client_secret,
+        http_post=http_post,
+        now=now,
+        not_connected_exc=OuraNotConnected,
+        api_error_exc=OuraAPIError,
+        missing_token_message="Run `hermes health connect` before Oura sync.",
+        invalid_token_message="Oura token file is invalid; re-run `/health connect`.",
+        missing_refresh_message="Oura refresh token missing; re-run `/health connect`.",
+        invalid_grant_message="Oura refresh failed; re-run `/health connect`.",
+        no_access_token_message=(
+            "Oura token refresh response did not include an access token."
+        ),
+    )
 
 
 def authorize_url(
@@ -1223,26 +1169,18 @@ def exchange_code_for_token(
     http_post: Callable[[str, dict[str, Any], dict[str, str] | None], dict[str, Any]],
     now: Callable[[], datetime] | None = None,
 ) -> dict[str, Any]:
-    clock = now or (lambda: datetime.now(UTC))
-    response = http_post(
-        OURA_TOKEN_URL,
-        {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": redirect_uri,
-            "client_id": client_id,
-            "client_secret": client_secret,
-        },
-        {"Content-Type": "application/x-www-form-urlencoded"},
+    return oauth_token.exchange_code_for_token(
+        token_url=OURA_TOKEN_URL,
+        client_id=client_id,
+        client_secret=client_secret,
+        code=code,
+        redirect_uri=redirect_uri,
+        http_post=http_post,
+        now=now,
+        api_error_exc=OuraAPIError,
+        error_message="Oura authorization failed.",
+        missing_tokens_message="Oura token response did not include required tokens.",
     )
-    if response.get("error"):
-        raise OuraAPIError("Oura authorization failed.")
-    if "access_token" not in response or "refresh_token" not in response:
-        raise OuraAPIError("Oura token response did not include required tokens.")
-    token = dict(response)
-    expires_in = int(token.get("expires_in", 3600))
-    token["expires_at"] = (clock() + timedelta(seconds=expires_in)).isoformat()
-    return token
 
 
 def token_expired(
@@ -1251,17 +1189,7 @@ def token_expired(
     now: Callable[[], datetime] | None = None,
     skew: timedelta = timedelta(minutes=5),
 ) -> bool:
-    expires_at = token.get("expires_at")
-    if not expires_at:
-        return True
-    clock = now or (lambda: datetime.now(UTC))
-    try:
-        expires = datetime.fromisoformat(str(expires_at))
-    except ValueError:
-        return True
-    if expires.tzinfo is None:
-        expires = expires.replace(tzinfo=UTC)
-    return expires <= clock() + skew
+    return oauth_token.token_expired(token, now=now, skew=skew)
 
 
 def fetch_paginated(
@@ -1361,20 +1289,14 @@ def http_post_form(
     data: dict[str, Any],
     headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    encoded = parse.urlencode(data).encode("utf-8")
-    req = urllib_request.Request(url, data=encoded, method="POST", headers=headers or {})
-    try:
-        with urllib_request.urlopen(req, timeout=30) as response:
-            body = _read_json_body(response)
-    except urllib_error.HTTPError as exc:
-        body = _read_json_body(exc)
-        if not isinstance(body, dict):
-            raise OuraAPIError(
-                f"Oura token endpoint failed with status {exc.code}."
-            ) from exc
-    if not isinstance(body, dict):
-        raise OuraAPIError("Oura token endpoint response JSON was not an object.")
-    return body
+    return oauth_token.http_post_form(
+        url,
+        data,
+        headers,
+        error_exc=OuraAPIError,
+        not_object_message="Oura token endpoint response JSON was not an object.",
+        http_error_message="Oura token endpoint failed with status {status}.",
+    )
 
 
 def _read_json_body(response: Any) -> Any:
@@ -1409,78 +1331,3 @@ def _retry_after(response: Any, retry_count: int) -> float:
         return float(headers.get("Retry-After", ""))
     except (TypeError, ValueError):
         return float(2**retry_count)
-
-
-def _write_json_atomic(path: Path, payload: dict[str, Any], *, private: bool) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, sort_keys=True)
-            handle.write("\n")
-        if private and os.name != "nt":
-            tmp_path.chmod(0o600)
-        os.replace(tmp_path, path)
-        if private and os.name != "nt":
-            path.chmod(0o600)
-    except Exception:
-        with contextlib.suppress(FileNotFoundError):
-            tmp_path.unlink()
-        raise
-
-
-def _read_env_file(path: Path) -> dict[str, str]:
-    values: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        values[key] = _unquote_env_value(value.strip())
-    return values
-
-
-def _quote_env_value(value: str) -> str:
-    return json.dumps(str(value))
-
-
-def _unquote_env_value(value: str) -> str:
-    if not value:
-        return ""
-    with contextlib.suppress(json.JSONDecodeError):
-        decoded = json.loads(value)
-        if isinstance(decoded, str):
-            return decoded
-    return value.strip("'\"")
-
-
-@contextlib.contextmanager
-def _platform_lock(handle: Any) -> Iterator[None]:
-    if os.name == "nt":
-        try:
-            import msvcrt
-        except ImportError:
-            yield
-            return
-        handle.seek(0)
-        try:
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-            yield
-        finally:
-            handle.seek(0)
-            with contextlib.suppress(OSError):
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        return
-
-    try:
-        import fcntl
-    except ImportError:
-        yield
-        return
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        yield
-    finally:
-        with contextlib.suppress(OSError):
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

@@ -52,6 +52,12 @@ DEFAULT_SOURCE_DEFINITIONS = {
         "status": "manual",
         "sync_mode": "manual",
     },
+    "google_health": {
+        "provider": "google_health",
+        "connection_name": "Google Health",
+        "status": "disconnected",
+        "sync_mode": "pull",
+    },
 }
 
 

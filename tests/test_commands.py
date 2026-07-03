@@ -886,6 +886,96 @@ def test_cli_health_connect_google_forwards_oauth_args(monkeypatch, tmp_path):
     }
 
 
+def test_cli_health_connect_google_health_forwards_oauth_args(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    commands = load_module("commands")
+    captured = {}
+
+    def fake_connect(**kwargs):
+        captured.update(kwargs)
+        return {"ok": False, "connected": False, "authorize_url": "https://accounts.google.com/x"}
+
+    monkeypatch.setattr(commands.google_health_auth, "connect_google_health", fake_connect)
+
+    result = commands.cli_health(
+        "connect-google-health --client-id cid --client-secret csecret --code abc --state st"
+    )
+
+    assert result["ok"] is False
+    assert captured == {
+        "client_id": "cid",
+        "client_secret": "csecret",
+        "code": "abc",
+        "state": "st",
+    }
+
+
+def test_cli_health_disconnect_google_health_removes_token(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    commands = load_module("commands")
+    commands.google_health_auth.save_token(
+        {"access_token": "gh-access", "refresh_token": "gh-refresh"}
+    )
+    assert commands.google_health_auth.token_path().exists()
+
+    result = commands.cli_health("disconnect-google-health")
+
+    assert result["ok"] is True
+    assert result["connected"] is False
+    assert not commands.google_health_auth.token_path().exists()
+    assert str(commands.google_health_auth.token_path()) in result["removed"]
+
+
+def test_sync_now_includes_google_health_and_degrades_when_not_connected(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    commands = load_module("commands")
+    monkeypatch.setattr(commands.oura, "sync_oura", lambda **_k: {"ok": True})
+    monkeypatch.setattr(
+        commands.context, "sync_google_workspace", lambda *_a, **_k: {"ok": False}
+    )
+
+    def not_connected(**_kwargs):
+        raise commands.google_health_auth.GoogleHealthNotConnected("not connected")
+
+    monkeypatch.setattr(commands.google_health, "sync_google_health", not_connected)
+
+    result = commands.cli_health("sync")
+
+    assert "google_health" in result
+    assert result["google_health"]["ok"] is False
+    assert "skipped" in result["google_health"]
+    assert result["ok"] is True  # oura succeeded
+
+
+def test_sync_now_reports_google_health_api_error(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    commands = load_module("commands")
+    monkeypatch.setattr(commands.oura, "sync_oura", lambda **_k: {"ok": False, "skipped": "x"})
+    monkeypatch.setattr(
+        commands.context, "sync_google_workspace", lambda *_a, **_k: {"ok": False}
+    )
+
+    def api_error(**_kwargs):
+        raise commands.google_health.GoogleHealthAPIError("boom")
+
+    monkeypatch.setattr(commands.google_health, "sync_google_health", api_error)
+
+    result = commands.cli_health("sync")
+
+    assert result["google_health"] == {"ok": False, "error": "boom"}
+
+
+def test_connect_google_health_does_not_echo_client_secret(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    commands = load_module("commands")
+
+    result = commands.connect_google_health(
+        client_id="client-id", client_secret="super-secret-value"
+    )
+
+    assert "super-secret-value" not in json.dumps(result, sort_keys=True)
+
+
 def test_cli_health_sync_reports_invalid_backfill_days(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     commands = load_module("commands")
