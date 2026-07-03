@@ -9,6 +9,14 @@ plans/
 .local/
 scratch/
 
+# Personal throwaway tests — never pushed; safe to delete before/after pushing.
+local_tests/
+
+# Personal working notes — not for upstream.
+progress.md
+PR_DESCRIPTION.md
+architecture.md
+
 # Local Python/dev artifacts.
 .venv/
 __pycache__/
