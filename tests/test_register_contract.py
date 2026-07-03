@@ -196,6 +196,58 @@ def test_entry_point_loads_without_root_plugin_init(tmp_path, monkeypatch):
     assert parsed.question == ["how", "did", "I", "sleep"]
 
 
+AUDIO_LOCATION_SUBCOMMANDS = {"connect-audio", "connect-location", "calibrate-audio"}
+
+
+def _load_package_entry():
+    sys.modules.pop("hermes_plugins.health_data", None)
+    sys.modules.setdefault("hermes_plugins", types.ModuleType("hermes_plugins"))
+    spec = importlib.util.spec_from_file_location(
+        "hermes_plugins.health_data",
+        ROOT / "__init__.py",
+        submodule_search_locations=[str(ROOT)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    module.__path__ = [str(ROOT)]
+    sys.modules["hermes_plugins.health_data"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_standalone_entry():
+    sys.modules.pop("hermes_plugins.health_data", None)
+    sys.modules.pop("hermes_plugins", None)
+    spec = importlib.util.spec_from_file_location(
+        "health_data_entry_parity", ROOT / "health_data_entry.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _health_cli_subcommands(module) -> set[str]:
+    ctx = FakeContext()
+    module.register(ctx)
+    cli_args = next(args for name, args, _kwargs in ctx.cli_commands if name == "health")
+    parser = argparse.ArgumentParser(prog="hermes health")
+    cli_args[1](parser)
+    choices: set[str] = set()
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            choices.update(action.choices.keys())
+    return choices
+
+
+def test_both_entry_loaders_expose_identical_health_subcommands(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    package_subcommands = _health_cli_subcommands(_load_package_entry())
+    standalone_subcommands = _health_cli_subcommands(_load_standalone_entry())
+
+    assert package_subcommands == standalone_subcommands
+    assert AUDIO_LOCATION_SUBCOMMANDS.issubset(package_subcommands)
+    assert AUDIO_LOCATION_SUBCOMMANDS.issubset(standalone_subcommands)
+
+
 def test_wheel_contains_entry_point_assets(tmp_path):
     wheel_dir = tmp_path / "wheels"
     wheel_dir.mkdir()

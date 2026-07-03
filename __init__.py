@@ -265,6 +265,42 @@ def _setup_health_cli_parser(parser, commands_module) -> None:
         )
     )
 
+    connect_audio_parser = subparsers.add_parser(
+        "connect-audio",
+        help="Register the local ambient-audio source and report the spool status.",
+    )
+    connect_audio_parser.set_defaults(
+        func=lambda _args: _print_cli_result(commands_module.connect_audio())
+    )
+
+    connect_location_parser = subparsers.add_parser(
+        "connect-location",
+        help="Register the local location source (requires precise_location_opt_in).",
+    )
+    connect_location_parser.set_defaults(
+        func=lambda _args: _print_cli_result(commands_module.connect_location())
+    )
+
+    calibrate_audio_parser = subparsers.add_parser(
+        "calibrate-audio",
+        help="Measure the ambient noise floor and set the audio silence threshold.",
+    )
+    calibrate_audio_parser.add_argument("--seconds", type=int, default=None)
+    calibrate_audio_parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Skip measuring and set this silence threshold (dBFS) directly.",
+    )
+    calibrate_audio_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Accept the suggested threshold without prompting.",
+    )
+    calibrate_audio_parser.set_defaults(
+        func=lambda args: _run_calibrate_audio(args, commands_module)
+    )
+
     google_parser = subparsers.add_parser(
         "connect-google",
         aliases=["google-connect", "google"],
@@ -416,6 +452,39 @@ def _setup_health_cli_parser(parser, commands_module) -> None:
         func=lambda args: _print_cli_result(
             commands_module.uninstall(purge=args.purge, yes=args.yes)
         )
+    )
+
+
+def _run_calibrate_audio(args: Any, commands_module: Any) -> Any:
+    if args.threshold is not None:
+        return _print_cli_result(
+            commands_module.set_audio_silence_threshold(threshold_db=args.threshold)
+        )
+    suggestion = commands_module.calibrate_audio(seconds=args.seconds)
+    if suggestion.get("status") != "ok":
+        return _print_cli_result(suggestion)
+    floor = suggestion["floor_db"]
+    suggested = suggestion["suggested_db"]
+    if suggestion.get("noisy"):
+        print("Note: sound was detected during calibration; consider re-running in a quiet moment.")
+    print(f"Measured quiet level ~{floor} dBFS. Suggested silence threshold: {suggested} dBFS.")
+    if args.yes:
+        chosen = suggested
+    else:
+        reply = input(
+            f"Accept {suggested} dBFS? [Enter=accept, a number to set your own, d=keep current]: "
+        ).strip()
+        if reply.lower() == "d":
+            return _print_cli_result({"status": "unchanged"})
+        if reply == "":
+            chosen = suggested
+        else:
+            try:
+                chosen = float(reply)
+            except ValueError:
+                return _print_cli_result({"status": "aborted", "reason": "not a number"})
+    return _print_cli_result(
+        commands_module.set_audio_silence_threshold(threshold_db=float(chosen))
     )
 
 

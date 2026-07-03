@@ -7,7 +7,38 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 9
+
+DAILY_OVERVIEW_SQL = """
+    CREATE VIEW daily_overview AS
+        SELECT
+            od.day,
+            od.readiness_score,
+            od.sleep_score,
+            od.activity_score,
+            od.stress_high_seconds,
+            od.recovery_high_seconds,
+            od.stress_day_summary,
+            od.resting_heart_rate,
+            od.hrv_balance,
+            od.spo2_average,
+            od.total_sleep_duration_seconds,
+            od.deep_sleep_duration_seconds,
+            od.primary_bedtime_start,
+            od.primary_bedtime_end,
+            cd.meeting_count,
+            cd.meeting_minutes,
+            cd.first_meeting_start,
+            cd.last_meeting_end,
+            ed.received_count,
+            ad.avg_noise_db,
+            ad.peak_noise_db,
+            ad.quiet_minutes
+        FROM oura_daily od
+        LEFT JOIN calendar_daily cd ON cd.day = od.day
+        LEFT JOIN email_daily ed ON ed.day = od.day
+        LEFT JOIN audio_daily ad ON ad.day = od.day
+"""
 
 
 class SyncAlreadyRunning(RuntimeError):
@@ -30,6 +61,7 @@ def connect() -> sqlite3.Connection:
     initialize()
     conn = sqlite3.connect(database_path())
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
@@ -263,6 +295,65 @@ def _migrate(conn: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS audio_windows (
+            window_start TEXT PRIMARY KEY,
+            window_end TEXT NOT NULL,
+            day TEXT NOT NULL,
+            duration_seconds REAL NOT NULL,
+            avg_noise_db REAL,
+            peak_noise_db REAL,
+            quiet_seconds REAL NOT NULL DEFAULT 0,
+            level_hist_db TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS audio_daily (
+            day TEXT PRIMARY KEY,
+            avg_noise_db REAL,
+            peak_noise_db REAL,
+            quiet_minutes REAL,
+            coverage_minutes REAL NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS audio_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            silence_threshold_db REAL NOT NULL DEFAULT -50.0,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS location_clusters (
+            location_id TEXT PRIMARY KEY,
+            centroid_lat_coarse REAL,
+            centroid_lng_coarse REAL,
+            radius_meters REAL,
+            visit_count INTEGER NOT NULL DEFAULT 0,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            user_label TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS location_visits (
+            visit_id TEXT PRIMARY KEY,
+            location_id TEXT NOT NULL REFERENCES location_clusters(location_id) ON DELETE CASCADE,
+            day TEXT NOT NULL,
+            arrival_at TEXT NOT NULL,
+            departure_at TEXT,
+            duration_minutes REAL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS location_audio_daily (
+            location_id TEXT NOT NULL REFERENCES location_clusters(location_id) ON DELETE CASCADE,
+            day TEXT NOT NULL,
+            avg_noise_db REAL,
+            quiet_minutes REAL,
+            visit_minutes REAL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (location_id, day)
+        );
+
         CREATE TABLE IF NOT EXISTS food_logs (
             id TEXT PRIMARY KEY,
             day TEXT NOT NULL,
@@ -453,34 +544,20 @@ def _migrate(conn: sqlite3.Connection) -> None:
             ON sync_errors(sync_run_id, sync_batch_id);
         CREATE INDEX IF NOT EXISTS idx_raw_records_source_object
             ON raw_records(source_id, object_type, extracted_at DESC);
-
-        CREATE VIEW IF NOT EXISTS daily_overview AS
-            SELECT
-                od.day,
-                od.readiness_score,
-                od.sleep_score,
-                od.activity_score,
-                od.stress_high_seconds,
-                od.recovery_high_seconds,
-                od.stress_day_summary,
-                od.resting_heart_rate,
-                od.hrv_balance,
-                od.spo2_average,
-                od.total_sleep_duration_seconds,
-                od.deep_sleep_duration_seconds,
-                od.primary_bedtime_start,
-                od.primary_bedtime_end,
-                cd.meeting_count,
-                cd.meeting_minutes,
-                cd.first_meeting_start,
-                cd.last_meeting_end,
-                ed.received_count
-            FROM oura_daily od
-            LEFT JOIN calendar_daily cd ON cd.day = od.day
-            LEFT JOIN email_daily ed ON ed.day = od.day;
+        CREATE INDEX IF NOT EXISTS idx_audio_windows_day
+            ON audio_windows(day);
+        CREATE INDEX IF NOT EXISTS idx_location_visits_day
+            ON location_visits(day);
+        CREATE INDEX IF NOT EXISTS idx_location_visits_location
+            ON location_visits(location_id, day);
         """
     )
     _ensure_column(conn, "oura_ring_battery", "producer_timestamp", "TEXT")
+    _ensure_column(conn, "audio_windows", "level_hist_db", "TEXT")
+    conn.execute(
+        "INSERT OR IGNORE INTO audio_settings(id, silence_threshold_db) VALUES (1, -50.0)"
+    )
+    _ensure_daily_overview(conn)
     from . import semantic_layer
 
     semantic_layer.ensure_canonical_schema(conn)
@@ -499,6 +576,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,))
     else:
         conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+
+
+def _ensure_daily_overview(conn: sqlite3.Connection) -> None:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(daily_overview)")}
+    if "avg_noise_db" in columns:
+        return
+    with conn:
+        conn.execute("DROP VIEW IF EXISTS daily_overview")
+        conn.execute(DAILY_OVERVIEW_SQL)
 
 
 def _ensure_onboarding_schema(conn: sqlite3.Connection) -> None:

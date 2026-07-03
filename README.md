@@ -25,6 +25,13 @@ Apollo turns personal signals into usable context for an agent:
 - Pulls Google Calendar and Gmail metadata through Hermes' Google Workspace
   helper so workload, meetings, and inbox pressure can be compared with health
   signals.
+- Records ambient loudness locally through a small native helper — average
+  level, peak, and a loudness histogram per minute — so noise exposure can be
+  lined up against sleep and stress. It measures how loud the room is, never what
+  is said, and no audio is recorded or stored.
+- Optionally groups location into anonymous places such as home, work, or the
+  gym, so loudness and health can be summarized per place. Off until you opt in,
+  and precise coordinates never leave your machine.
 - Gives Hermes tools for recent health state, date ranges, stress days,
   correlations, heart-rate windows, workouts, sessions, tags, coverage checks,
   and higher-level analysis plans.
@@ -67,6 +74,13 @@ not commit or publish user data. Calendar and Gmail syncs store redacted
 metadata and counts; Gmail body content, snippets, OAuth secrets, credential
 files, calendar attendee identities, and route/map artifacts are either
 intentionally not persisted or blocked from release by scanner and CI tripwires.
+
+Ambient audio and location are handled by a separate local program,
+`apollo-sense`, that only ever writes summary numbers to a spool file — loudness
+levels for audio, anonymous place ids and coarse centroids for location. Raw
+audio samples and precise coordinates are discarded inside that program and never
+reach the plugin or the database. Location is opt-in and stays dark until you
+enable it.
 
 WHOOP support is documented for future connector work, but this release does
 not include a `hermes health connect-whoop` command yet.
@@ -325,6 +339,96 @@ shared skill can request broader Workspace scopes than this health plugin
 persists. The health plugin's sync path stores redacted calendar metadata,
 Gmail message metadata/counts, sync status, and provenance in `~/.hermes/health.db`.
 
+## Ambient audio and location
+
+Apollo can fold two local signals into the same daily tables as Oura and
+calendar: how loud your surroundings are, and, if you opt in, which anonymous
+place you were in. Both come from a small native helper, `apollo-sense`, kept in
+this repository under `apollo-sense/`. It reads the microphone (and, for
+location, GPS) and writes only summary numbers to a spool file. Raw audio and
+exact coordinates are thrown away inside the helper and never touch `health.db`.
+
+Ambient audio is the working path today. Location clustering is included and
+opt-in, but wiring a live GPS device (gpsd/NMEA/geoclue) is not part of this
+release yet, so location currently expects a ping feed rather than a phone or
+watch.
+
+### Build the helper
+
+`apollo-sense` is a Rust program with a small C kernel. Building it needs a Rust
+toolchain, a C compiler, and, on Linux, the ALSA development headers. On Debian
+or Ubuntu, install the prerequisites and build:
+
+```bash
+sudo apt install build-essential libasound2-dev
+cd apollo-sense
+cargo build --release
+```
+
+Point the plugin at the built binary with `APOLLO_SENSE_BIN`, or put it on your
+`PATH` as `apollo-sense`, then confirm the microphone works before enabling
+anything:
+
+```bash
+export APOLLO_SENSE_BIN="$PWD/target/release/apollo-sense"
+apollo-sense check
+```
+
+### Ambient audio
+
+The helper measures loudness in one-minute windows and appends them to
+`~/.hermes/audio_spool.jsonl`. Capture a single minute with `once`, or leave
+`run` going until you stop it:
+
+```bash
+apollo-sense once 60
+apollo-sense run
+```
+
+Register the source and sync it into `health.db` like any other connector:
+
+```bash
+hermes health connect-audio
+hermes health sync
+```
+
+After a sync, `hermes health sync` includes an `audio` block and loudness shows
+up next to your other daily signals, for questions such as "was I noisier on my
+worst sleep nights?".
+
+The line between quiet and not-quiet depends on your room and microphone, so it
+is a setting rather than a fixed number. Run `calibrate-audio` on its own to
+measure your floor and confirm a suggestion, pass `--yes` to accept it without
+prompting, or `--threshold` to set a value directly in dBFS:
+
+```bash
+hermes health calibrate-audio
+hermes health calibrate-audio --yes
+hermes health calibrate-audio --threshold -20
+```
+
+Calibration is retroactive: it re-scores the loudness history you already
+captured, so you never have to re-record after changing the threshold.
+
+### Location
+
+Location is off until `precise_location_opt_in` is set in your health profile.
+Until then, `hermes health connect-location` and the location part of
+`hermes health sync` return `skipped` and touch nothing.
+
+Once enabled, `apollo-sense` groups pings into anonymous places (`Location_A`,
+`Location_B`, and so on), keeps only completed visits, and stores coarse
+centroids, never your exact path. Register and sync it the same way:
+
+```bash
+hermes health connect-location
+hermes health sync
+```
+
+Visits are joined against ambient audio per day, so you can ask which place was
+loudest or where your stress ran highest without any place ever being named or
+precisely located.
+
 ## Sensitive data warning
 
 The plugin stores health and context data in `~/.hermes/health.db`. That SQLite
@@ -339,11 +443,16 @@ tables: `health_sources`, `source_scopes`, `sync_runs`, `sync_batches`,
 `food_logs`, `sync_state`, and `daily_overview` tables remain the query
 surface.
 
+Ambient audio and location add `audio_windows`, `audio_daily`, `audio_settings`,
+`location_clusters`, `location_visits`, and `location_audio_daily`. These hold
+only loudness numbers and anonymous place summaries; raw audio and precise
+coordinates are never written.
+
 `raw_records` stores Oura payloads and redacted Google metadata locally so
 future migrations can be traced back to provider records. Gmail body content,
 Gmail snippets, OAuth secrets, credential files, calendar attendee identities,
-conference join details, and precise location coordinates are not persisted by
-default.
+conference join details, raw audio samples, and precise location coordinates are
+not persisted by default.
 
 ## Commands
 
@@ -354,6 +463,10 @@ hermes health connect-google
 hermes health connect-google --open-browser
 hermes health connect-google --client-secret /path/to/google_client_secret.json --open-browser
 hermes health connect-google --auth-code '<FULL_LOCALHOST_REDIRECT_URL>'
+hermes health connect-audio
+hermes health connect-location
+hermes health calibrate-audio
+hermes health calibrate-audio --threshold -20
 hermes health sync
 hermes health sync --days 30
 hermes health sync --start-date 2026-05-12 --end-date 2026-06-10

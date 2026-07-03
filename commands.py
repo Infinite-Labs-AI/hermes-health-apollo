@@ -14,7 +14,7 @@ import tempfile
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
-from . import context, onboarding, oura, store
+from . import audio, context, location, onboarding, oura, store
 
 SYNC_CRON_JOB_NAME = "health-data-sync"
 SYNC_CRON_SCHEDULE = "every 6h"
@@ -134,12 +134,53 @@ def sync_now(*_args, **kwargs) -> dict:
             "email_days": 0,
             "skipped": "Google Workspace sync skipped because sync arguments were invalid.",
         }
+    try:
+        audio_sync = audio.sync_audio(trigger_kind="manual")
+        audio_result = {"ok": audio_sync["status"] == "ok", **audio_sync}
+    except audio.AudioNotConnected as exc:
+        audio_result = {"ok": False, "skipped": str(exc)}
+    except audio.AudioSyncError as exc:
+        audio_result = {"ok": False, "error": str(exc)}
+    try:
+        location_sync = location.sync_location(trigger_kind="manual")
+        location_result = {"ok": location_sync.get("status") == "ok", **location_sync}
+    except location.LocationNotConnected as exc:
+        location_result = {"ok": False, "skipped": str(exc)}
+    except location.LocationSyncError as exc:
+        location_result = {"ok": False, "error": str(exc)}
     return {
-        "ok": bool(oura_result.get("ok")) or bool(google_result.get("ok")),
+        "ok": bool(oura_result.get("ok"))
+        or bool(google_result.get("ok"))
+        or bool(audio_result.get("ok"))
+        or bool(location_result.get("ok")),
         "freshness_policy_hours": onboarding.FRESHNESS_POLICY_HOURS,
         "oura": oura_result,
         "google_workspace": google_result,
+        "audio": audio_result,
+        "location": location_result,
     }
+
+
+def connect_audio(*_args, **_kwargs) -> dict:
+    return audio.connect_audio()
+
+
+def connect_location(*_args, **_kwargs) -> dict:
+    return location.connect_location()
+
+
+def calibrate_audio(*_args, **kwargs) -> dict:
+    try:
+        suggestion = audio.calibrate_suggestion(seconds=kwargs.get("seconds"))
+    except audio.AudioNotConnected as error:
+        return {"status": "unavailable", "reason": str(error)}
+    except audio.AudioSyncError as error:
+        return {"status": "error", "reason": str(error)}
+    return {"status": "ok", **suggestion}
+
+
+def set_audio_silence_threshold(*_args, **kwargs) -> dict:
+    return audio.set_silence_threshold(threshold_db=float(kwargs["threshold_db"]))
 
 
 def connect(*_args, **kwargs) -> dict:
