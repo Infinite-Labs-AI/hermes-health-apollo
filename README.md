@@ -10,7 +10,12 @@ and generated analysis all live under your Hermes profile instead of inside this
 repository.
 
 Maintainer: RTK (X: `@RiverKhan`).
-Community: Discord <https://discord.gg/AeUbSYas>
+Community, for non-sensitive questions only: Discord <https://discord.gg/AeUbSYas>
+Security and privacy reports: use private reporting in
+[`SECURITY.md`](SECURITY.md). Do not post health data, OAuth material, local
+database contents, logs, callback URLs, or other sensitive context in public
+issues or chat.
+License: MIT; see [`LICENSE`](LICENSE).
 
 Prerequisite: Hermes Agent must already be installed and configured:
 <https://github.com/NousResearch/hermes-agent>. Apollo is the `health-data`
@@ -76,7 +81,8 @@ not include a `hermes health connect-whoop` command yet.
 Prerequisite: install and configure Hermes Agent first. This repository supplies
 the `health-data` plugin; it does not install Hermes itself.
 
-For development from a local checkout:
+Current install path: install from a local source checkout. A PyPI package is
+not the normal install path until a published package exists.
 
 ```bash
 make install-git-hooks
@@ -105,12 +111,16 @@ time, and destination. `hermes health status` reports that metadata so stale
 installed copies are visible. This command is intended for contributors and
 local testing.
 
-For normal use once a package is published:
+Future PyPI package, only after publication:
 
 ```bash
 pip install hermes-health-data
 hermes plugins enable health-data
 ```
+
+Until the `hermes-health-data` project exists on PyPI, use the source-checkout
+install path above. Do not treat the future `pip install` command as current
+release instructions.
 
 Restart Hermes after enabling, then run setup:
 
@@ -460,10 +470,20 @@ installed plugin copy, reads only install metadata, and includes cron/gateway
 status guidance. It does not read or export health databases, OAuth tokens, or
 other personal data.
 
-Before pushing public changes, run the same secret tripwire used by CI:
+Before pushing public changes, run the current repository gate. This repository
+does not currently track a `uv.lock` file and `.gitignore` ignores generated
+lockfiles, so the local `uv` setup is intentionally non-frozen unless the
+project changes that policy in a separate dependency/lockfile PR. The package
+artifact tests call `python -m pip wheel`, so the local `.venv` must be seeded
+with `pip`.
 
 ```bash
-python scripts/secret_scan.py
+uv venv --seed --clear .venv
+uv sync --extra dev
+uv run --extra dev python -m pytest
+uv run --extra dev python scripts/secret_scan.py
+uv run --extra dev python scripts/secret_scan.py --all-files
+git diff --check
 ```
 
 The default scan checks git-tracked files and blocks private workspace paths
