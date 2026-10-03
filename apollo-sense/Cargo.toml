@@ -1,0 +1,15 @@
+[package]
+name = "apollo-sense"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "apollo-sense"
+path = "src/main.rs"
+
+[dependencies]
+cpal = "0.15"
+
+[build-dependencies]
+cc = "1"
