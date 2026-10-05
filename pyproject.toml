@@ -7,7 +7,7 @@ name = "hermes-health-data"
 version = "0.1.0"
 description = "Standalone Hermes plugin for local health and daily-context data."
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.15"
 license = { text = "MIT" }
 authors = [
   { name = "RTK", email = "apollo@ultima.inc" },
